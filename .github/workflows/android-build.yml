@@ -63,7 +63,7 @@ jobs:
 
       - name: Build KOReader Android (arm64)
         run: |
-          ANDROID=1 make TARGET=android-arm64 release
+          ./kodev release android-arm64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
