@@ -1,0 +1,57 @@
+name: android-build
+
+on:
+  push:
+    branches: [feature/onedrive-integration]
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-33 build-tools;33.0.0 ndk;27.1.12297006 cmake;3.22.1'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl file gettext git nasm pkg-config unzip wget autoconf automake libtool cmake
+
+      - name: Initialize Android toolchain
+        run: |
+          export ANDROID_HOME=${{ github.workspace }}/toolchain/android-sdk
+          mkdir -p $ANDROID_HOME
+          ln -s $ANDROID_SDK_ROOT $ANDROID_HOME
+          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006
+          export ANDROID_NDK=$ANDROID_NDK_HOME
+          make TARGET=android fetchthirdparty
+
+      - name: Build KOReader Android
+        run: |
+          export PATH=$JAVA_HOME/bin:$PATH
+          ANDROID=1 ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/27.1.12297006 make release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: koreader-onedrive
+          path: |
+            *.apk
+            koreader-android-*.apk
