@@ -4,10 +4,22 @@ on:
   push:
     branches: [feature/onedrive-integration]
   workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Target architecture (arm64, arm, x86)'
+        required: true
+        default: 'arm64'
 
 jobs:
   android:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - android-arm64
+          - android-arm
+      fail-fast: false
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,36 +34,32 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-33 build-tools;33.0.0 ndk;27.1.12297006 cmake;3.22.1'
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
+          packages: 'platforms;android-33 build-tools;33.0.0 ndk;27.1.12297006'
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl file gettext git nasm pkg-config unzip wget autoconf automake libtool cmake
+          sudo apt-get install -y build-essential curl file gettext git nasm pkg-config unzip wget autoconf automake libtool cmake ninja-build
 
-      - name: Initialize Android toolchain
+      - name: Fetch third-party dependencies
         run: |
-          export ANDROID_HOME=${{ github.workspace }}/toolchain/android-sdk
-          mkdir -p $ANDROID_HOME
-          ln -s $ANDROID_SDK_ROOT $ANDROID_HOME
           export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006
           export ANDROID_NDK=$ANDROID_NDK_HOME
-          make TARGET=android fetchthirdparty
+          make TARGET=${{ matrix.target }} fetchthirdparty
 
-      - name: Build KOReader Android
+      - name: Build KOReader
         run: |
+          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006
+          export ANDROID_NDK=$ANDROID_NDK_HOME
           export PATH=$JAVA_HOME/bin:$PATH
-          ANDROID=1 ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/27.1.12297006 make release
+          make TARGET=${{ matrix.target }} all VERBOSE=1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: koreader-onedrive
+          name: koreader-${{ matrix.target }}
           path: |
-            *.apk
-            koreader-android-*.apk
+            build/*.apk
+            koreader-*.apk
+            platform/android/luajit-launcher/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
