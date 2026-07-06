@@ -15,6 +15,7 @@ local _ = require("gettext")
 local server_types = {
     dropbox = _("Dropbox"),
     webdav = _("WebDAV"),
+    onedrive = _("OneDrive"),
 }
 local indent = ""
 
@@ -39,7 +40,7 @@ function SyncService:generateItemTable()
     -- select and/or add server
     local added_servers = LuaSettings:open(DataStorage:getSettingsDir().."/cloudstorage.lua"):readSetting("cs_servers") or {}
     for _, server in ipairs(added_servers) do
-        if server.type == "dropbox" or server.type == "webdav" then
+        if server.type == "dropbox" or server.type == "webdav" or server.type == "onedrive" then
             local item = {
                 text = indent .. server.name,
                 address = server.address,
@@ -92,6 +93,8 @@ function SyncService.getReadablePath(server)
         url = "/" .. url
     elseif server.type == "webdav" then
         url = (server.address:sub(-1) == "/" and server.address or server.address .. "/") .. url
+    elseif server.type == "onedrive" then
+        url = "OneDrive:/" .. url
     end
     if url:sub(-2) == "//" then url = url:sub(1, -2) end
     return url
@@ -145,16 +148,24 @@ function SyncService.sync(server, file_path, sync_cb, is_silent)
             timeout = 3,
         })
     end
-    if server.type ~= "dropbox" and server.type ~= "webdav" then
+    if server.type ~= "dropbox" and server.type ~= "webdav" and server.type ~= "onedrive" then
         show_msg(_("Wrong server type."))
         return
     end
     local code_response = 412 -- If-Match header failed
     local etag
-    local api = server.type == "dropbox" and require("apps/cloudstorage/dropboxapi") or require("apps/cloudstorage/webdavapi")
+    local api = server.type == "dropbox" and require("apps/cloudstorage/dropboxapi")
+        or server.type == "webdav" and require("apps/cloudstorage/webdavapi")
+        or require("apps/cloudstorage/onedriveapi")
     local token = server.password
     if server.type == "dropbox" and not (server.address == nil or server.address == "") then
         token = api:getAccessToken(server.password, server.address)
+    elseif server.type == "onedrive" then
+        local JSON = require("json")
+        local od_settings = JSON.decode(server.password)
+        local OneDrive = require("apps/cloudstorage/onedrive")
+        token = OneDrive:resolveAccessToken(od_settings)
+        server.password = JSON.encode(od_settings)
     end
     while code_response == 412 do
         os.remove(income_file_path)
@@ -165,6 +176,10 @@ function SyncService.sync(server, file_path, sync_cb, is_silent)
             local path = api:getJoinedPath(server.address, server.url)
             path = api:getJoinedPath(path, file_name)
             code_response, etag = api:downloadFile(path, server.username, server.password, income_file_path)
+        elseif server.type == "onedrive" then
+            local url_base = server.url == "/" and "" or server.url
+            local remote_path = url_base .. "/" .. file_name
+            code_response = api:downloadFileByPath(remote_path, token, income_file_path)
         end
         if code_response ~= 200 and code_response ~= 404
            and not (server.type == "dropbox" and code_response == 409) then
@@ -184,6 +199,9 @@ function SyncService.sync(server, file_path, sync_cb, is_silent)
             local path = api:getJoinedPath(server.address, server.url)
             path = api:getJoinedPath(path, file_name)
             code_response = api:uploadFile(path, server.username, server.password, file_path, etag)
+        elseif server.type == "onedrive" then
+            local url_base = server.url == "/" and "" or server.url
+            code_response = api:uploadFile(url_base, token, file_path)
         end
     end
     os.remove(income_file_path)

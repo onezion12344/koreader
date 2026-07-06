@@ -15,6 +15,8 @@ local PathChooser = require("ui/widget/pathchooser")
 local ProgressbarDialog = require("ui/widget/progressbardialog")
 local UIManager = require("ui/uimanager")
 local WebDav = require("apps/cloudstorage/webdav")
+local OneDrive = require("apps/cloudstorage/onedrive")
+local JSON = require("json")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local _ = require("gettext")
@@ -34,6 +36,7 @@ local server_types = {
     dropbox = _("Dropbox"),
     ftp = _("FTP"),
     webdav = _("WebDAV"),
+    onedrive = _("OneDrive"),
 }
 
 function CloudStorage:init()
@@ -130,6 +133,24 @@ function CloudStorage:selectCloudType()
     return true
 end
 
+function CloudStorage:getOneDriveSettings()
+    if self._onedrive_settings then
+        return self._onedrive_settings
+    end
+    if self.password and self.password ~= "" then
+        local ok, decoded = pcall(JSON.decode, self.password)
+        if ok and decoded and decoded.refresh_token then
+            self._onedrive_settings = decoded
+            return decoded
+        end
+    end
+end
+
+function CloudStorage:saveOneDriveSettings(od_settings)
+    self._onedrive_settings = od_settings
+    self.password = JSON.encode(od_settings)
+end
+
 function CloudStorage:generateDropBoxAccessToken()
     if self.username or self.address == nil or self.address == "" then
         -- short-lived token has been generated already in this session
@@ -164,10 +185,20 @@ function CloudStorage:openCloudServer(url)
             return
         end
         tbl, e = WebDav:run(self.address, self.username, self.password, url, self.choose_folder_mode)
+    elseif self.type == "onedrive" then
+        if NetworkMgr:willRerunWhenOnline(function() self:openCloudServer(url) end) then
+            return
+        end
+        local od_settings = self:getOneDriveSettings()
+        if od_settings then
+            tbl, e = OneDrive:run(url, od_settings, self.choose_folder_mode)
+        else
+            e = "OneDrive not configured"
+        end
     end
     if tbl then
         self:switchItemTable(url, tbl)
-        if self.type == "dropbox" or self.type == "webdav" then
+        if self.type == "dropbox" or self.type == "webdav" or self.type == "onedrive" then
             self.onLeftButtonTap = function()
                 self:showPlusMenu(url)
             end
@@ -231,6 +262,9 @@ function CloudStorage:downloadFile(item)
                 Ftp:downloadFile(unit_item, address, username, password, path_dir, callback_close, nil)
             elseif self.type == "webdav" then
                 WebDav:downloadFile(unit_item, address, username, password, path_dir, callback_close, progress_callback)
+            elseif self.type == "onedrive" then
+                local od_settings = self:getOneDriveSettings()
+                OneDrive:downloadFile(unit_item, od_settings, path_dir, callback_close, progress_callback)
             end
 
             progressbar_dialog:close()
@@ -414,7 +448,7 @@ function CloudStorage:onMenuHold(item)
                 },
             },
         }
-        if item.type == "dropbox" then
+        if item.type == "dropbox" or item.type == "onedrive" then
             table.insert(buttons, {
                 {
                     text = _("Synchronize now"),
@@ -450,15 +484,27 @@ function CloudStorage:synchronizeCloud(item)
     local Trapper = require("ui/trapper")
     Trapper:wrap(function()
         Trapper:setPausedText("Download paused.\nDo you want to continue or abort downloading files?")
-        if self:generateDropBoxAccessToken() then
+        local authenticated = false
+        if self.type == "dropbox" then
+            authenticated = self:generateDropBoxAccessToken()
+        elseif self.type == "onedrive" then
+            local od = self:getOneDriveSettings()
+            local token = OneDrive:resolveAccessToken(od)
+            if token then
+                self:saveOneDriveSettings(od)
+                authenticated = true
+            end
+        end
+        if authenticated then
             local ok, downloaded_files, failed_files = pcall(self.downloadListFiles, self, item)
+            local cloud_name = server_types[self.type] or _("cloud")
             if ok and downloaded_files then
                 if not failed_files then failed_files = 0 end
                 local text
                 if downloaded_files == 0 and failed_files == 0 then
-                    text = _("No files to download from Dropbox.")
+                    text = T(_("No files to download from %1."), cloud_name)
                 else
-                    text = T(N_("Successfully downloaded 1 file from Dropbox to local storage.", "Successfully downloaded %1 files from Dropbox to local storage.", downloaded_files), downloaded_files)
+                    text = T(N_("Successfully downloaded 1 file from %1 to local storage.", "Successfully downloaded %1 files from %2 to local storage.", downloaded_files), downloaded_files, cloud_name)
                     if failed_files > 0 then
                         text = text .. "\n" .. T(N_("Failed to download 1 file.", "Failed to download %1 files.", failed_files), failed_files)
                     end
@@ -468,9 +514,9 @@ function CloudStorage:synchronizeCloud(item)
                     timeout = 3,
                 })
             else
-                Trapper:reset() -- close any last widget not cleaned if error
+                Trapper:reset()
                 UIManager:show(InfoMessage:new{
-                    text = _("No files to download from Dropbox.\nPlease check your configuration and connection."),
+                    text = T(_("No files to download from %1.\nPlease check your configuration and connection."), cloud_name),
                     timeout = 3,
                 })
             end
@@ -494,8 +540,14 @@ function CloudStorage:downloadListFiles(item)
             end
         end
     end
-    local remote_files = DropBox:showFiles(item.sync_source_folder, self.password)
-    if #remote_files == 0 then
+    local remote_files
+    if self.type == "dropbox" then
+        remote_files = DropBox:showFiles(item.sync_source_folder, self.password)
+    elseif self.type == "onedrive" then
+        local od_settings = self:getOneDriveSettings()
+        remote_files = OneDrive:showFiles(item.sync_source_folder, od_settings)
+    end
+    if not remote_files or #remote_files == 0 then
         UI:clear()
         return false
     end
@@ -525,7 +577,12 @@ function CloudStorage:downloadListFiles(item)
             if not go_on then
                 break
             end
-            response = DropBox:downloadFileNoUI(file.url, self.password, item.sync_dest_folder .. "/" .. file.text)
+            if self.type == "dropbox" then
+                response = DropBox:downloadFileNoUI(file.url, self.password, item.sync_dest_folder .. "/" .. file.text)
+            elseif self.type == "onedrive" then
+                local od_settings = self:getOneDriveSettings()
+                response = OneDrive:downloadFileNoUI(file.url, od_settings, item.sync_dest_folder .. "/" .. file.text)
+            end
             if response then
                 success_files = success_files + 1
             else
@@ -539,15 +596,16 @@ end
 
 function CloudStorage:synchronizeSettings(item)
     local syn_dialog
-    local dropbox_sync_folder = item.sync_source_folder or "not set"
+    local cloud_name = server_types[self.type] or _("Cloud")
+    local cloud_sync_folder = item.sync_source_folder or "not set"
     local local_sync_folder = item.sync_dest_folder or "not set"
     syn_dialog = ButtonDialog:new {
-        title = T(_("Dropbox folder:\n%1\nLocal folder:\n%2"), BD.dirpath(dropbox_sync_folder), BD.dirpath(local_sync_folder)),
+        title = T(_("%1 folder:\n%2\nLocal folder:\n%3"), cloud_name, BD.dirpath(cloud_sync_folder), BD.dirpath(local_sync_folder)),
         title_align = "center",
         buttons = {
             {
                 {
-                    text = _("Choose Dropbox folder"),
+                    text = T(_("Choose %1 folder"), cloud_name),
                     callback = function()
                         UIManager:close(syn_dialog)
                         require("ui/downloadmgr"):new{
@@ -654,6 +712,9 @@ function CloudStorage:uploadFile(url)
                         DropBox:uploadFile(url_base, self.password, file_path, callback_close)
                     elseif self.type == "webdav" then
                         WebDav:uploadFile(url_base, self.address, self.username, self.password, file_path, callback_close)
+                    elseif self.type == "onedrive" then
+                        local od_settings = self:getOneDriveSettings()
+                        OneDrive:uploadFile(url_base, od_settings, file_path, callback_close)
                     end
                 end)
             end
@@ -696,6 +757,9 @@ function CloudStorage:createFolder(url)
                             DropBox:createFolder(url_base, self.password, folder_name, callback_close)
                         elseif self.type == "webdav" then
                             WebDav:createFolder(url_base, self.address, self.username, self.password, folder_name, callback_close)
+                        elseif self.type == "onedrive" then
+                            local od_settings = self:getOneDriveSettings()
+                            OneDrive:createFolder(url_base, od_settings, folder_name, callback_close)
                         end
                     end,
                 },
@@ -742,6 +806,14 @@ function CloudStorage:configCloud(type)
                 url = fields[5],
                 type = "webdav",
             })
+        elseif type == "onedrive" then
+            table.insert(cs_servers,{
+                name = fields[1],
+                password = fields[2],
+                address = fields[3],
+                url = fields[4],
+                type = "onedrive",
+            })
         end
         cs_settings:saveSetting("cs_servers", cs_servers)
         cs_settings:flush()
@@ -755,6 +827,9 @@ function CloudStorage:configCloud(type)
     end
     if type == "webdav" then
         WebDav:config(nil, callbackAdd)
+    end
+    if type == "onedrive" then
+        OneDrive:config(nil, callbackAdd)
     end
 end
 
@@ -797,6 +872,17 @@ function CloudStorage:editCloudServer(item)
                     break
                 end
             end
+        elseif item.type == "onedrive" then
+            for i, server in ipairs(cs_servers) do
+                if server.name == updated_config.text and server.type == "onedrive" then
+                    server.name = fields[1]
+                    server.password = fields[2]
+                    server.address = fields[3]
+                    server.url = fields[4]
+                    cs_servers[i] = server
+                    break
+                end
+            end
         end
         cs_settings:saveSetting("cs_servers", cs_servers)
         cs_settings:flush()
@@ -808,6 +894,8 @@ function CloudStorage:editCloudServer(item)
         Ftp:config(item, callbackEdit)
     elseif item.type == "webdav" then
         WebDav:config(item, callbackEdit)
+    elseif item.type == "onedrive" then
+        OneDrive:config(item, callbackEdit)
     end
 end
 
@@ -840,6 +928,14 @@ function CloudStorage:infoServer(item)
         Ftp:info(item)
     elseif item.type == "webdav" then
         WebDav:info(item)
+    elseif item.type == "onedrive" then
+        if NetworkMgr:willRerunWhenOnline(function() self:infoServer(item) end) then
+            return
+        end
+        local od_settings = self:getOneDriveSettings()
+        if od_settings then
+            OneDrive:info(od_settings)
+        end
     end
 end
 
