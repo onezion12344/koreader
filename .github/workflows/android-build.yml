@@ -19,11 +19,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-33 build-tools;33.0.0 ndk;27.1.12297006 cmake;3.22.1'
-
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -34,24 +29,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential curl file gettext git nasm pkg-config unzip wget autoconf automake libtool cmake
 
-      - name: Initialize Android toolchain
+      - name: Setup NDK r23c
         run: |
-          export ANDROID_HOME=${{ github.workspace }}/toolchain/android-sdk
-          mkdir -p $ANDROID_HOME
-          ln -s $ANDROID_SDK_ROOT $ANDROID_HOME
-          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006
-          export ANDROID_NDK=$ANDROID_NDK_HOME
-          make TARGET=android fetchthirdparty
+          NDK_DIR="${{ github.workspace }}/toolchain/android-ndk-r23c"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "Downloading Android NDK r23c..."
+            wget -q https://dl.google.com/android/repository/android-ndk-r23c-linux.zip -O /tmp/ndk.zip
+            mkdir -p "$(dirname "$NDK_DIR")"
+            unzip -q /tmp/ndk.zip -d "$(dirname "$NDK_DIR")"
+          fi
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK=$NDK_DIR" >> $GITHUB_ENV
 
-      - name: Build KOReader Android
+      - name: Setup Android SDK
         run: |
-          export PATH=$JAVA_HOME/bin:$PATH
-          ANDROID=1 ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/27.1.12297006 make release
+          SDK_DIR="${{ github.workspace }}/toolchain/android-sdk-linux"
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "Setting up minimal Android SDK..."
+            mkdir -p "$SDK_DIR"
+            # Use runner SDK if available, otherwise download minimal cmdline-tools
+            if [ -d "$ANDROID_SDK_ROOT" ]; then
+              # Copy just what we need from the pre-installed SDK
+              cp -r "$ANDROID_SDK_ROOT/platforms" "$SDK_DIR/" 2>/dev/null || true
+              cp -r "$ANDROID_SDK_ROOT/build-tools" "$SDK_DIR/" 2>/dev/null || true
+              cp -r "$ANDROID_SDK_ROOT/platform-tools" "$SDK_DIR/" 2>/dev/null || true
+              cp -r "$ANDROID_SDK_ROOT/tools" "$SDK_DIR/" 2>/dev/null || true
+              cp -r "$ANDROID_SDK_ROOT/cmdline-tools" "$SDK_DIR/" 2>/dev/null || true
+            fi
+          fi
+          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
+
+      - name: Build KOReader Android (arm64)
+        run: |
+          ANDROID=1 make TARGET=android-arm64 release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: koreader-onedrive
+          name: koreader-onedrive-arm64
           path: |
             *.apk
             koreader-android-*.apk
