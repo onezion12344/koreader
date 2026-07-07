@@ -20,10 +20,18 @@ local GRAPH_BASE       = "https://graph.microsoft.com/v1.0"
 -- OneDrive scopes needed
 local SCOPES = "Files.ReadWrite offline_access"
 
+-- Default client ID for KOReader OneDrive integration.
+local DEFAULT_CLIENT_ID = "80d04e6c-72b8-43db-a134-a5775cbe0c58"
+
+local function resolveClientId(client_id)
+    return client_id and client_id ~= "" and client_id or DEFAULT_CLIENT_ID
+end
+
 --- Get a device code for user authentication.
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { device_code, user_code, verification_uri, message, expires_in }
 function OneDriveApi:getDeviceCode(client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "client_id=" .. socket.url.escape(client_id)
         .. "&scope=" .. socket.url.escape(SCOPES)
@@ -51,9 +59,10 @@ end
 
 --- Poll for access token after user completes device login.
 -- @param device_code string from getDeviceCode
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { access_token, refresh_token, expires_in }, or nil
 function OneDriveApi:pollForToken(device_code, client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
         .. "&device_code=" .. socket.url.escape(device_code)
@@ -87,9 +96,10 @@ end
 
 --- Refresh an expired access token.
 -- @param refresh_token string
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { access_token, refresh_token, expires_in }, or nil
 function OneDriveApi:refreshAccessToken(refresh_token, client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "grant_type=refresh_token"
         .. "&refresh_token=" .. socket.url.escape(refresh_token)
