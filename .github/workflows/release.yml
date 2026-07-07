@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags: [v*]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl file gettext git nasm pkg-config unzip wget autoconf automake libtool cmake ninja-build
+          pip install meson
+
+      - name: Setup NDK r23c
+        run: |
+          NDK_DIR="${{ github.workspace }}/toolchain/android-ndk-r23c"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "Downloading Android NDK r23c..."
+            wget -q https://dl.google.com/android/repository/android-ndk-r23c-linux.zip -O /tmp/ndk.zip
+            mkdir -p "$(dirname "$NDK_DIR")"
+            unzip -q /tmp/ndk.zip -d "$(dirname "$NDK_DIR")"
+          fi
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK=$NDK_DIR" >> $GITHUB_ENV
+
+      - name: Setup Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Build KOReader Android (arm64)
+        run: |
+          ./kodev release android-arm64
+
+      - name: Sign APK
+        run: |
+          APK=$(ls koreader-android-arm64-*.apk 2>/dev/null || ls build/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find platform/android/luajit-launcher/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          fi
+          echo "Found APK: $APK"
+          cp "$APK" koreader-onedrive-arm64.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: KOReader OneDrive ${{ github.event.inputs.tag || github.ref_name }}
+          files: koreader-onedrive-arm64.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
