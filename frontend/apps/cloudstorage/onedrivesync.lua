@@ -16,7 +16,7 @@ local SYNC_ROOT_FOLDER = ".koreader-sync"
 
 -- Resolve access token (reuse from OneDrive module if available, or standalone)
 local function resolveToken(od_settings)
-    if not od_settings or not od_settings.refresh_token or not od_settings.client_id then
+    if not od_settings or not od_settings.refresh_token then
         return nil
     end
     local now = os.time()

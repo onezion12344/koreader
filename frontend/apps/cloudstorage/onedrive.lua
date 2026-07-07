@@ -1,5 +1,6 @@
 local BD = require("ui/bidi")
 local ConfirmBox = require("ui/widget/confirmbox")
+local Device = require("device")
 local DocumentRegistry = require("document/documentregistry")
 local InfoMessage = require("ui/widget/infomessage")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
@@ -23,8 +24,9 @@ function OneDrive:resolveAccessToken(od_settings)
             return od_settings.access_token
         end
     end
-    if od_settings.refresh_token and od_settings.client_id then
-        local result = OneDriveApi:refreshAccessToken(od_settings.refresh_token, od_settings.client_id)
+    if od_settings.refresh_token then
+        local cid = od_settings.client_id
+        local result = OneDriveApi:refreshAccessToken(od_settings.refresh_token, cid)
         if result and result.access_token then
             od_settings.access_token = result.access_token
             if result.refresh_token then
@@ -136,167 +138,132 @@ function OneDrive:createFolder(url, od_settings, folder_name, callback_close)
 end
 
 function OneDrive:config(item, callback)
-    local text_info = _([[
-OneDrive uses Microsoft device code authentication.
-
-1. Enter your Azure AD application (client) ID.
-   Register one free at https://portal.azure.com
-   → App registrations → New registration
-   → Set redirect URI to:
-   https://login.microsoftonline.com/common/oauth2/nativeclient
-   → Under Authentication, enable "Device code" flow
-
-2. After saving you'll get a code and a URL.
-   Visit the URL on any device, enter the code, and sign in.
-
-Tokens are auto-refreshed.]])
-
-    local text_name, text_client_id
-    if item then
-        text_name = item.text
-        text_client_id = item.address
-    end
+    local text_name = item and item.text or nil
 
     self.settings_dialog = MultiInputDialog:new{
         title = _("OneDrive cloud storage"),
         fields = {
             {
                 text = text_name,
-                hint = _("Cloud storage displayed name"),
-            },
-            {
-                text = text_client_id,
-                hint = _("Azure AD Application (client) ID"),
+                hint = _("Display name (optional)"),
             },
         },
-        buttons = {
+        buttons = {{
             {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function()
-                        self.settings_dialog:onClose()
-                        UIManager:close(self.settings_dialog)
-                    end
-                },
-                {
-                    text = _("Info"),
-                    callback = function()
-                        UIManager:show(InfoMessage:new{ text = text_info })
-                    end
-                },
-                {
-                    text = _("Authorize"),
-                    is_enter_default = true,
-                    callback = function()
-                        local fields = self.settings_dialog:getFields()
-                        local display_name = fields[1] or _("OneDrive")
-                        local client_id = fields[2]
-                        if not client_id or client_id == "" then
-                            UIManager:show(InfoMessage:new{
-                                text = _("Client ID is required."),
-                                timeout = 3,
-                            })
-                            return
-                        end
-                        self.settings_dialog:onClose()
-                        UIManager:close(self.settings_dialog)
-                        self:_startDeviceAuth(display_name, client_id, item, callback)
-                    end
-                },
+                text = _("Cancel"),
+                id = "close",
+                callback = function()
+                    self.settings_dialog:onClose()
+                    UIManager:close(self.settings_dialog)
+                end
             },
-        },
+            {
+                text = _("Sign in with Microsoft"),
+                is_enter_default = true,
+                callback = function()
+                    local fields = self.settings_dialog:getFields()
+                    local display_name = fields[1] ~= "" and fields[1] or _("OneDrive")
+                    self.settings_dialog:onClose()
+                    UIManager:close(self.settings_dialog)
+                    self:_startDeviceAuth(display_name, item, callback)
+                end
+            },
+        }},
     }
     UIManager:show(self.settings_dialog)
     self.settings_dialog:onShowKeyboard()
 end
 
-function OneDrive:_startDeviceAuth(display_name, client_id, existing_item, callback)
-    local result = OneDriveApi:getDeviceCode(client_id)
+function OneDrive:_startDeviceAuth(display_name, existing_item, callback)
+    local result = OneDriveApi:getDeviceCode()
     if not result or not result.device_code then
         UIManager:show(InfoMessage:new{
-            text = _("Could not start device authentication.\nPlease check your client ID and network connection."),
+            text = _("Could not start authentication.\nPlease check your network connection."),
             timeout = 5,
         })
         return
     end
 
-    -- Show the user code and URL
-    local auth_info = T(_([[
-To authorize OneDrive access:
+    local auth_url = result.verification_uri or "https://microsoft.com/devicelogin"
+    local user_code = result.user_code
+    -- Pre-fill the code: Microsoft's device login page accepts ?code= query param
+    local auth_link = auth_url .. "?code=" .. (user_code or "")
 
-1. Open this URL in a browser:
+    -- Try to open the browser directly; fall back to showing the link
+    local opened = false
+    if Device:canOpenLink() then
+        opened = Device:openLink(auth_link)
+    end
+
+    if opened then
+        UIManager:show(InfoMessage:new{
+            text = T(_([[
+Browser opened for Microsoft sign-in.
+
+If the code is not pre-filled, enter:
 %1
 
-2. Enter this code:
-%2
+Waiting for you to complete sign-in...]]), user_code),
+            timeout = 30,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_([[
+To authorize OneDrive:
 
-3. Sign in with your Microsoft account.
+1. Open: %1
+2. Code: %2
 
-KOReader will wait for you to complete this step.]]),
-        result.verification_uri or "https://microsoft.com/devicelogin",
-        result.user_code)
+The code should be pre-filled. Sign in with your Microsoft account.]]), auth_link, user_code),
+            timeout = 60,
+        })
+    end
 
-    UIManager:show(InfoMessage:new{
-        text = auth_info,
-        timeout = 60,
-    })
-
-    -- Poll for token completion (non-blocking via UIManager schedule)
+    -- Poll for token completion
     local device_code = result.device_code
     local interval = result.interval or 5
     local expires_at = os.time() + (result.expires_in or 900)
-    local poll_count = 0
 
     local function doPoll()
-        poll_count = poll_count + 1
         if os.time() >= expires_at then
             UIManager:show(InfoMessage:new{
-                text = _("Device authentication timed out.\nPlease try again."),
+                text = _("Authentication timed out.\nPlease try again."),
                 timeout = 5,
             })
             return
         end
 
-        local token_result = OneDriveApi:pollForToken(device_code, client_id)
+        local token_result = OneDriveApi:pollForToken(device_code)
         if token_result and token_result.access_token then
-            -- Success
             local od_settings = {
                 access_token = token_result.access_token,
                 refresh_token = token_result.refresh_token,
-                client_id = client_id,
                 expires_at = os.time() + (token_result.expires_in or 3600),
-            end
+            }
             local od_settings_json = require("json").encode(od_settings)
 
             if existing_item then
-                -- Edit: update existing
-                local fields = {
+                callback(existing_item, {
                     display_name,
                     od_settings_json,
-                    client_id,
-                    "/",
-                }
-                callback(existing_item, fields)
+                    "",
+                    existing_item.url or "/",
+                })
             else
-                -- New: create
-                local fields = {
+                callback({
                     display_name,
                     od_settings_json,
-                    client_id,
+                    "",
                     "/",
-                }
-                callback(fields)
+                })
             end
             UIManager:show(InfoMessage:new{
                 text = _("OneDrive connected successfully!"),
                 timeout = 3,
             })
         elseif token_result and token_result.error == "authorization_pending" then
-            -- Still waiting, poll again
             UIManager:scheduleIn(interval, doPoll)
         else
-            -- Error
             UIManager:show(InfoMessage:new{
                 text = _("OneDrive authentication failed.\nPlease try again."),
                 timeout = 5,

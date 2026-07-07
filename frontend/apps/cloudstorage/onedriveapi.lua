@@ -20,10 +20,20 @@ local GRAPH_BASE       = "https://graph.microsoft.com/v1.0"
 -- OneDrive scopes needed
 local SCOPES = "Files.ReadWrite offline_access"
 
+-- Default client ID for KOReader OneDrive integration.
+-- Register your own at https://portal.azure.com for production use.
+local DEFAULT_CLIENT_ID = "80d04e6c-72b8-43db-a134-a5775cbe0c58"
+
+-- Resolve client_id from parameter or default.
+local function resolveClientId(client_id)
+    return client_id and client_id ~= "" and client_id or DEFAULT_CLIENT_ID
+end
+
 --- Get a device code for user authentication.
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { device_code, user_code, verification_uri, message, expires_in }
 function OneDriveApi:getDeviceCode(client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "client_id=" .. socket.url.escape(client_id)
         .. "&scope=" .. socket.url.escape(SCOPES)
@@ -51,9 +61,10 @@ end
 
 --- Poll for access token after user completes device login.
 -- @param device_code string from getDeviceCode
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { access_token, refresh_token, expires_in }, or nil
 function OneDriveApi:pollForToken(device_code, client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
         .. "&device_code=" .. socket.url.escape(device_code)
@@ -87,9 +98,10 @@ end
 
 --- Refresh an expired access token.
 -- @param refresh_token string
--- @param client_id Azure AD application client ID
+-- @param client_id optional Azure AD application client ID
 -- @return table { access_token, refresh_token, expires_in }, or nil
 function OneDriveApi:refreshAccessToken(refresh_token, client_id)
+    client_id = resolveClientId(client_id)
     local sink = {}
     local body = "grant_type=refresh_token"
         .. "&refresh_token=" .. socket.url.escape(refresh_token)
@@ -424,6 +436,291 @@ function OneDriveApi:showFiles(folder_path, token)
         ::continue::
     end
     return files
+end
+
+--- Delete a file or folder by path.
+-- @param path user-facing path (e.g. "/Documents/book.pdf")
+-- @param token access token
+-- @return number HTTP status code
+function OneDriveApi:deleteItem(path, token)
+    local drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. drive_path
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "DELETE",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+        },
+    })
+    socketutil:reset_timeout()
+    if code < 200 or code > 299 then
+        logger.warn("OneDriveApi: cannot delete item:", status or code)
+    end
+    return code
+end
+
+--- Rename a file or folder.
+-- @param path user-facing path (e.g. "/Documents/old.pdf")
+-- @param token access token
+-- @param new_name new name for the item
+-- @return table|nil updated item metadata, or nil on failure
+function OneDriveApi:renameItem(path, token, new_name)
+    local drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. drive_path
+    local body = JSON.encode({ name = new_name })
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "PATCH",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Content-Type"]  = "application/json",
+            ["Content-Length"] = string.len(body),
+        },
+        source  = ltn12.source.string(body),
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 200 then
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result
+    end
+    logger.warn("OneDriveApi: cannot rename item:", status or code)
+end
+
+--- Move a file or folder to a new parent folder.
+-- @param path user-facing source path (e.g. "/Documents/book.pdf")
+-- @param token access token
+-- @param new_parent_path destination folder path (e.g. "/Archive")
+-- @return table|nil updated item metadata, or nil on failure
+function OneDriveApi:moveItem(path, token, new_parent_path)
+    local item_drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. item_drive_path
+    local parent_ref = buildDrivePath(new_parent_path)
+    local body = JSON.encode({ parentReference = { path = "/drive/" .. parent_ref } })
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "PATCH",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Content-Type"]  = "application/json",
+            ["Content-Length"] = string.len(body),
+        },
+        source  = ltn12.source.string(body),
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 200 then
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result
+    end
+    logger.warn("OneDriveApi: cannot move item:", status or code)
+end
+
+--- Copy a file or folder.
+-- @param path user-facing source path
+-- @param token access token
+-- @param new_parent_path destination folder path
+-- @param new_name optional new name for the copy
+-- @return string|nil URL to monitor async copy progress, or nil on failure
+function OneDriveApi:copyItem(path, token, new_parent_path, new_name)
+    local item_drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. item_drive_path .. ":/copy"
+    local parent_ref = buildDrivePath(new_parent_path)
+    local req_body = { parentReference = { path = "/drive/" .. parent_ref } }
+    if new_name then req_body.name = new_name end
+    local body = JSON.encode(req_body)
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Content-Type"]  = "application/json",
+            ["Content-Length"] = string.len(body),
+        },
+        source  = ltn12.source.string(body),
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 202 then
+        -- Returns a Location header for monitoring progress
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result and result.location
+    end
+    logger.warn("OneDriveApi: cannot copy item:", status or code)
+end
+
+--- Search files and folders by name query.
+-- @param query search string (matches file/folder names)
+-- @param token access token
+-- @return table|nil list of matching items
+function OneDriveApi:searchFiles(query, token)
+    if not query or query == "" then return {} end
+    local all_results = {}
+    local next_link = GRAPH_BASE .. "/me/drive/root/search(q='" .. socket.url.escape(query) .. "')?$top=500"
+    while next_link do
+        local sink = {}
+        socketutil:set_timeout()
+        local code, _, status = socket.skip(1, http.request{
+            url     = next_link,
+            method  = "GET",
+            headers = {
+                ["Authorization"] = "Bearer " .. token,
+            },
+            sink    = ltn12.sink.table(sink),
+        })
+        socketutil:reset_timeout()
+        if code == 200 then
+            local _, result = pcall(JSON.decode, table.concat(sink))
+            if result and result.value then
+                for _, item in ipairs(result.value) do
+                    table.insert(all_results, item)
+                end
+            end
+            next_link = result and result["@odata.nextLink"]
+            if next_link then
+                -- Graph returns nextLink with single-quoted query; needs escaping
+                next_link = next_link:gsub("'", "''")
+            end
+        else
+            logger.warn("OneDriveApi: search failed:", status or code)
+            break
+        end
+    end
+    return all_results
+end
+
+--- Get incremental changes since last sync (delta API).
+-- @param token access token
+-- @param delta_link optional deltaLink from previous call for incremental results
+-- @return table { entries, delta_link, reset_link }
+function OneDriveApi:getDelta(token, delta_link)
+    local url = delta_link or (GRAPH_BASE .. "/me/drive/root/delta?$top=500")
+    local all_entries = {}
+    local current_link = url
+    while current_link do
+        local sink = {}
+        socketutil:set_timeout()
+        local code, _, status = socket.skip(1, http.request{
+            url     = current_link,
+            method  = "GET",
+            headers = {
+                ["Authorization"] = "Bearer " .. token,
+            },
+            sink    = ltn12.sink.table(sink),
+        })
+        socketutil:reset_timeout()
+        if code == 200 then
+            local _, result = pcall(JSON.decode, table.concat(sink))
+            if result and result.value then
+                for _, item in ipairs(result.value) do
+                    table.insert(all_entries, item)
+                end
+            end
+            current_link = result and result["@odata.nextLink"]
+            if result and result["@odata.deltaLink"] then
+                return {
+                    entries = all_entries,
+                    delta_link = result["@odata.deltaLink"],
+                    reset_link = result["@odata.nextLink"],
+                }
+            end
+        else
+            logger.warn("OneDriveApi: delta query failed:", status or code)
+            break
+        end
+    end
+end
+
+--- Create a sharing link for a file or folder.
+-- @param path user-facing path
+-- @param token access token
+-- @param link_type "view" (default), "edit", or "embed"
+-- @return table|nil { link, type, webUrl }, or nil on failure
+function OneDriveApi:createShareLink(path, token, link_type)
+    link_type = link_type or "view"
+    local drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. drive_path .. ":/createLink"
+    local body = JSON.encode({ type = link_type })
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Content-Type"]  = "application/json",
+            ["Content-Length"] = string.len(body),
+        },
+        source  = ltn12.source.string(body),
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code >= 200 and code <= 299 then
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result
+    end
+    logger.warn("OneDriveApi: cannot create share link:", status or code)
+end
+
+--- Get detailed metadata for a file or folder.
+-- @param path user-facing path
+-- @param token access token
+-- @return table|nil item metadata, or nil on failure
+function OneDriveApi:getItemMetadata(path, token)
+    local drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. drive_path
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "GET",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+        },
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 200 then
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result
+    end
+    logger.warn("OneDriveApi: cannot get item metadata:", status or code)
+end
+
+--- Create a writable upload session for large files (> 4 MB).
+-- @param path user-facing destination path (e.g. "/Documents/large.pdf")
+-- @param token access token
+-- @return table|nil { uploadUrl, expirationDateTime }, or nil on failure
+function OneDriveApi:createUploadSession(path, token)
+    local drive_path = buildDrivePath(path)
+    local url = GRAPH_BASE .. "/me/drive/" .. drive_path .. ":/createUploadSession"
+    local body = JSON.encode({ item = { ["@microsoft.graph.conflictBehavior"] = "replace" } })
+    local sink = {}
+    socketutil:set_timeout()
+    local code, _, status = socket.skip(1, http.request{
+        url     = url,
+        method  = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Content-Type"]  = "application/json",
+            ["Content-Length"] = string.len(body),
+        },
+        source  = ltn12.source.string(body),
+        sink    = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 200 then
+        local _, result = pcall(JSON.decode, table.concat(sink))
+        return result
+    end
+    logger.warn("OneDriveApi: cannot create upload session:", status or code)
 end
 
 return OneDriveApi
