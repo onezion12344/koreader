@@ -2,7 +2,7 @@ name: android-build
 
 on:
   push:
-    branches: [feature/onedrive-integration]
+    branches: [feature/onedrive-integration, feature/onedrive-advanced]
   workflow_dispatch:
 
 jobs:
